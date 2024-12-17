@@ -6,7 +6,7 @@ import os
 import logging
 
 from collections import defaultdict
-from datasets import load_dataset
+from datasets import load_dataset, load_from_disk
 
 from .pretraining_preparation import main_process_first
 from ..backend.utils import prepare_downstream_dataloader
@@ -21,12 +21,17 @@ def prepare_task_dataloaders(tokenizer, cfg_eval, cfg_impl):
     max_seq_length = cfg_eval.max_seq_length
     tasks = defaultdict(dict)
 
+    print(cfg_eval.tasks.items())
     for task_name, task_details in cfg_eval.tasks.items():
         log.info(f"Preparing data for task {task_details.collection}-{task_name}.")
         tasks[task_name]["details"] = task_details
-        raw_datasets = load_dataset(task_details.collection, task_name, cache_dir=cfg_impl.path)
+        
+        if task_details.collection == 'super_glue':
+            raw_datasets = load_from_disk('/home/duyifan/tjy/cramming/local_data/local_super_glue/rte')
+        else:
+            raw_datasets = load_dataset(task_details.collection, task_name, trust_remote_code=True)
         if "train_data_source" in task_details:  # some superGLUE tasks do not include train data
-            raw_data_train = load_dataset(task_details.collection, task_details.train_data_source, cache_dir=cfg_impl.path)
+            raw_data_train = load_dataset(task_details.collection, task_details.train_data_source, trust_remote_code=True)
             if cfg_eval.tasks["rte"].structure != task_details.structure:
                 for new_name, old_name in zip(task_details.structure, cfg_eval.tasks["rte"].structure):
                     raw_data_train = raw_data_train.rename_column(old_name, new_name)

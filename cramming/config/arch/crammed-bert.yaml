@@ -33,7 +33,7 @@ embedding:
   stable_low_precision: False
 
 attention:
-  type: self-attention # also works with "pytorch"
+  type: self-attention-new # also works with "pytorch"
   causal_attention: False
   num_attention_heads: 12
   dropout_prob: 0.1
