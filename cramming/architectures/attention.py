@@ -15,6 +15,8 @@ def get_attention_mechanism(
 ):
     if cfg_attention.type == "self-attention":
         mechanism = SeqFirstSelfAttention(hidden_size, cfg_attention)  # neox
+    elif cfg_attention.type == "self-attention-new":
+        mechanism = CustomizedSeqFirstSelfAttention(hidden_size, cfg_attention)
     elif cfg_attention.type == "pytorch":
         # Sanity check 1: [Warning: This includes the output projection twice...]
         mechanism = SelfAttentionPyTorch(hidden_size, cfg_attention)  # torch default
@@ -356,6 +358,219 @@ class SeqFirstSelfAttention(LegacySeqFirstSelfAttention):
 
         # change view [b, np, sq, hn]
         context_layer = context_layer.view(*output_size)
+        return context_layer
+
+class CustomizedLegacySeqFirstSelfAttention(torch.nn.Module):
+    """Self-attention layer.
+
+    This is the gpt neo-x implementation from:
+    https://github.com/EleutherAI/gpt-neox/blob/main/megatron/model/transformer.py (which is a megatron variant)
+
+    Self-attention layer takes input with size [Seq, Batch, Hidden]
+    and returns output of the same size.
+    """
+
+    __constants__ = ["LAYOUT", "attention_dropout"]
+    LAYOUT: str = "[S B H]"
+    norm_factor: torch.Tensor
+
+    def __init__(self, hidden_size: int, cfg_attention):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.num_attention_heads = cfg_attention.num_attention_heads
+        self.hidden_per_head = self.hidden_size // cfg_attention.num_attention_heads
+        self.register_buffer("norm_factor", torch.tensor(self.hidden_per_head).rsqrt())
+
+        # Strided linear layer.
+        self.query_value = torch.nn.Linear(self.hidden_size, 2 * self.hidden_size, bias=cfg_attention.qkv_bias)
+        self.pairwise_factor = torch.nn.Parameter(torch.randn(self.num_attention_heads, self.hidden_per_head, self.hidden_per_head))
+        self.output_dim = hidden_size
+        if cfg_attention.rotary_embedding == "sanity":
+            self.rotary_emb = RotarySanityCheck(self.hidden_per_head, seq_dim=0)
+        elif cfg_attention.rotary_embedding == "v2":
+            self.rotary_emb = RotaryEleutherAI(self.hidden_per_head)
+        elif cfg_attention.rotary_embedding == "llama":
+            self.rotary_emb = RotaryLLAMA(self.hidden_per_head)
+        elif cfg_attention.rotary_embedding:
+            self.rotary_emb = Rotary(self.hidden_per_head, seq_dim=0)
+        else:
+            self.rotary_emb = None
+
+        if cfg_attention.sequence_op == "torch-softmax":
+            self.sequence_op = TorchSoftmax(cfg_attention.seq_op_in_fp32)
+        elif cfg_attention.sequence_op == "torch-norm":
+            self.sequence_op = TorchNormalize(self.num_attention_heads, cfg_attention.seq_op_in_fp32)
+        elif cfg_attention.sequence_op == "none":
+            self.sequence_op = ScaledIdentity(cfg_attention.seq_op_in_fp32)
+        elif cfg_attention.sequence_op == "cumsum":
+            self.sequence_op = Cumsum(cfg_attention.seq_op_in_fp32)
+        elif cfg_attention.sequence_op == "cumsumexp":
+            self.sequence_op = CumsumExp(cfg_attention.seq_op_in_fp32)
+        else:
+            raise ValueError(f"Invalid sequence operation {cfg_attention.sequence_op} given.")
+
+        self.attention_dropout: float = cfg_attention.dropout_prob
+
+    def attention(self, query_layer, query_layer_k, value_layer, attention_mask: Optional[torch.Tensor] = None, training: bool = False):
+        # ===================================
+        # Raw attention scores. [b, np, s, s]
+        # ===================================
+
+        # [b, np, sq, sk]
+        output_size = (query_layer.shape[1], query_layer.shape[2], query_layer.shape[0], query_layer_k.shape[0])
+
+        # [sq, b, np, hn] -> [sq, b * np, hn]
+        query_layer = query_layer.view(output_size[2], output_size[0] * output_size[1], -1)
+        query_layer_k = query_layer_k.view(output_size[3], output_size[0] * output_size[1], -1)
+
+        pairwise_factor_for_cal = self.pairwise_factor.repeat(output_size[0], 1, 1)
+
+        q_multip_pairwise_factor = torch.bmm(query_layer.transpose(0, 1), pairwise_factor_for_cal)
+        # [b * np, sq, hn] * [b * np, hn, hn] = [b * np, sq, hn]
+
+        # preallocating result tensor: [b * np, sq, sk]
+        matmul_result = torch.empty(
+            output_size[0] * output_size[1],
+            output_size[2],
+            output_size[3],
+            dtype=query_layer.dtype,
+            device=query_layer.device,
+        )  # this looks crazy but beta=0 below skips the values of this tensor [so beta is NOT optional...]
+
+        # Raw attention scores. [b * np, sq, sk]
+        matmul_result = torch.baddbmm(
+            matmul_result,
+            q_multip_pairwise_factor,  # [b * np, sq, hn]
+            query_layer_k.transpose(0, 1).transpose(1, 2),  # [b * np, hn, sk]
+            beta=0.0,
+            alpha=self.norm_factor,
+        )
+
+        # change view to [b, np, sq, sk]
+        attention_scores = matmul_result.view(output_size[0], output_size[1], output_size[2], output_size[3])
+
+        # ===========================
+        # Attention probs and dropout
+        # ===========================
+        # attention scores and attention mask [b, np, sq, sk]
+        attention_probs = self.sequence_op(attention_scores, attention_mask)
+
+        # This is actually dropping out entire tokens to attend to, which might
+        # seem a bit unusual, but is taken from the original Transformer paper.
+        # [And in great ML tradition I keep this comment in place as it was in megatron and huggingface-bert before :>]
+        # attention_probs = self.attention_dropout(attention_probs)
+        attention_probs = torch.nn.functional.dropout(attention_probs, p=self.attention_dropout, training=training)
+        # =========================
+        # Context layer. [sq, b, hp]
+        # =========================
+
+        # value_layer -> context layer.
+        # [sk, b, np, hn] --> [b, np, sq, hn]
+
+        # context layer shape: [b, np, sq, hn]
+        output_size = (value_layer.shape[1], value_layer.shape[2], query_layer.shape[0], value_layer.shape[3])
+
+        # change view [sk, b * np, hn]
+        value_layer = value_layer.view(value_layer.size(0), output_size[0] * output_size[1], -1)
+
+        # change view [b * np, sq, sk]
+        attention_probs = attention_probs.view(output_size[0] * output_size[1], output_size[2], -1)
+
+        # matmul: [b * np, sq, hn]
+        context_layer = torch.bmm(attention_probs, value_layer.transpose(0, 1))
+
+        # change view [b, np, sq, hn]
+        context_layer = context_layer.view(*output_size)
+        return context_layer
+
+    def forward(self, hidden_states, attention_mask: Optional[torch.Tensor] = None):
+        # =====================
+        # hidden_states: [sq, b, h]
+        # Query, Key, and Value
+        # =====================
+        # Attention heads [sq, b, h] --> [sq, b, (np * 2 * hn)]
+        mixed_x_layer = self.query_value(hidden_states)
+
+        # [sq, b, (np * 2 * hn)] --> [sq, b, np, 2 * hn]
+        # new_tensor_shape = mixed_x_layer.size()[:-1] + (self.num_attention_heads, 3 * self.hidden_per_head)
+        mixed_x_layer = mixed_x_layer.view(
+            hidden_states.shape[0], hidden_states.shape[1], self.num_attention_heads, 2 * self.hidden_per_head
+        )
+
+        # [sq, b, np, 2 * hn] --> 2 [sq, b, np, hn]
+        (query_layer, value_layer) = torch.split(mixed_x_layer, [self.hidden_per_head] * 2, dim=3)
+
+        if self.rotary_emb is not None:
+            query_layer, query_layer_k = self.rotary_emb(query_layer, query_layer)
+        else:
+            query_layer_k = query_layer
+
+        # ==================================
+        # Attention computation
+        # ==================================
+        context_layer = self.attention(query_layer, query_layer_k, value_layer, attention_mask, self.training)
+        # [b, np, sq, hn] --> [sq, b, np, hn]
+        context_layer = context_layer.permute(2, 0, 1, 3).contiguous()
+
+        # [sq, b, np, hn] --> [sq, b, hp]
+        # new_context_layer_shape = context_layer.size()[:-2] + (self.hidden_size,)
+        context_layer = context_layer.view(context_layer.shape[0], context_layer.shape[1], self.hidden_size)
+        return context_layer
+
+
+class CustomizedSeqFirstSelfAttention(CustomizedLegacySeqFirstSelfAttention):
+    """Self-attention layer.
+
+    This is the gpt neo-x implementation from:
+    https://github.com/EleutherAI/gpt-neox/blob/main/megatron/model/transformer.py (which is a megatron variant)
+
+    This is a modified version of the neo-x implementation that I can manage to compile without graph breaks
+    """
+
+    __constants__ = ["LAYOUT", "attention_dropout"]
+    LAYOUT: str = "[S B H]"
+    norm_factor: torch.Tensor
+
+    def attention(self, query_layer, key_layer, value_layer, attention_mask: Optional[torch.Tensor] = None, training: bool = False):
+        # 原始形状: query_layer/key_layer/value_layer: [sq, b, np, hn]
+        # 现将转置放在首要地位，并保持四维结构:
+        # 转为 [b, np, sq, hn] 以匹配更直观的维度顺序
+        query_layer = query_layer.permute(1, 2, 0, 3)   # [b, np, sq, hn]
+        key_layer = key_layer.permute(1, 2, 0, 3)       # [b, np, sk, hn]
+        value_layer = value_layer.permute(1, 2, 0, 3)   # [b, np, sk, hn]
+        # pairwise_factor: [np, hn, hn]
+        # 可以通过广播让其适用于 [b, np, sq, hn] 和 [b, np, hn, sk]，无需 repeat。
+        # 下面的计算中 pairwise_factor 不带batch维度，但会在 [b, ...] 上广播。
+        # A = query_layer @ pairwise_factor: [b, np, sq, hn] x [np, hn, hn] -> [b, np, sq, hn]
+        # 注意：需要对einsum或matmul进行适配，使得 pairwise_factor 对 np 维度对齐
+        # 若 pairwise_factor 为 [num_heads, hn, hn] 与 query_layer 的 np 对齐，则可使用einsum：
+        # "b n s d, n d h -> b n s h" 再 "b n s h, b n h s -> b n s s"
+        # 这里需要稍加改写，以减少转置次数和保持一致性。
+
+        # step1: query_layer @ pairwise_factor
+        # pairwise_factor: [np, hn, hn]
+        # query_layer: [b, np, sq, hn]
+        # 使用einsum进行头维对齐:
+        q_times_pf = torch.einsum('bnsd,ndh->bnsh', query_layer, self.pairwise_factor)
+        # q_times_pf: [b, np, sq, hn]
+
+        # step2: (q_times_pf @ key_layer.transpose(-1, -2))
+        # key_layer: [b, np, sk, hn] -> key_layer.transpose(-1, -2): [b, np, hn, sk]
+        attention_scores = torch.einsum('bnsh,bnhk->bnsk', q_times_pf, key_layer.transpose(-1, -2)) * self.norm_factor
+        # attention_scores: [b, np, sq, sk]
+
+        # 后续操作不变
+        if attention_mask is not None:
+            attention_scores = attention_scores + attention_mask
+
+        attention_probs = self.sequence_op(attention_scores, attention_mask)
+        attention_probs = torch.nn.functional.dropout(attention_probs, p=self.attention_dropout, training=training)
+
+        # 计算context
+        # attention_probs: [b, np, sq, sk]
+        # value_layer: [b, np, sk, hn]
+        context_layer = torch.einsum('bnsk,bnkd->bnsd', attention_probs, value_layer)  
+        # context_layer: [b, np, sq, hn]
         return context_layer
 
 
