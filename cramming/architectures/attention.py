@@ -532,26 +532,16 @@ class CustomizedSeqFirstSelfAttention(CustomizedLegacySeqFirstSelfAttention):
     norm_factor: torch.Tensor
 
     def attention(self, query_layer, key_layer, value_layer, attention_mask: Optional[torch.Tensor] = None, training: bool = False):
-        # 原始形状: query_layer/key_layer/value_layer: [sq, b, np, hn]
-        # 现将转置放在首要地位，并保持四维结构:
-        # 转为 [b, np, sq, hn] 以匹配更直观的维度顺序
-        query_layer = query_layer.permute(1, 2, 0, 3)   # [b, np, sq, hn]
-        key_layer = key_layer.permute(1, 2, 0, 3)       # [b, np, sk, hn]
-        value_layer = value_layer.permute(1, 2, 0, 3)   # [b, np, sk, hn]
+        # 原始形状: query_layer/key_layer/value_layer: [sq, b, np, hn], 转为 [b, np, sq, hn] 以匹配更直观的维度顺序
+        query_layer = query_layer.permute(1, 2, 0, 3)
+        key_layer = key_layer.permute(1, 2, 0, 3)
+        value_layer = value_layer.permute(1, 2, 0, 3)
         # pairwise_factor: [np, hn, hn]
-        # 可以通过广播让其适用于 [b, np, sq, hn] 和 [b, np, hn, sk]，无需 repeat。
-        # 下面的计算中 pairwise_factor 不带batch维度，但会在 [b, ...] 上广播。
-        # A = query_layer @ pairwise_factor: [b, np, sq, hn] x [np, hn, hn] -> [b, np, sq, hn]
-        # 注意：需要对einsum或matmul进行适配，使得 pairwise_factor 对 np 维度对齐
-        # 若 pairwise_factor 为 [num_heads, hn, hn] 与 query_layer 的 np 对齐，则可使用einsum：
-        # "b n s d, n d h -> b n s h" 再 "b n s h, b n h s -> b n s s"
-        # 这里需要稍加改写，以减少转置次数和保持一致性。
+        # 通过广播机制让其适用于 [b, np, sq, hn] 和 [b, np, hn, sk]，无需 repeat。
 
         # step1: query_layer @ pairwise_factor
-        # pairwise_factor: [np, hn, hn]
-        # query_layer: [b, np, sq, hn]
-        # 使用einsum进行头维对齐:
-        q_times_pf = torch.einsum('bnsd,ndh->bnsh', query_layer, self.pairwise_factor)
+        # pairwise_factor: [np, hn, hn], query_layer: [b, np, sq, hn]
+        q_times_pf = torch.einsum('bnsd,ndh->bnsh', query_layer, self.pairwise_factor)     # 使用einsum进行头维对齐:
         # q_times_pf: [b, np, sq, hn]
 
         # step2: (q_times_pf @ key_layer.transpose(-1, -2))
@@ -559,16 +549,12 @@ class CustomizedSeqFirstSelfAttention(CustomizedLegacySeqFirstSelfAttention):
         attention_scores = torch.einsum('bnsh,bnhk->bnsk', q_times_pf, key_layer.transpose(-1, -2)) * self.norm_factor
         # attention_scores: [b, np, sq, sk]
 
-        # 后续操作不变
         if attention_mask is not None:
             attention_scores = attention_scores + attention_mask
 
         attention_probs = self.sequence_op(attention_scores, attention_mask)
         attention_probs = torch.nn.functional.dropout(attention_probs, p=self.attention_dropout, training=training)
 
-        # 计算context
-        # attention_probs: [b, np, sq, sk]
-        # value_layer: [b, np, sk, hn]
         context_layer = torch.einsum('bnsk,bnkd->bnsd', attention_probs, value_layer)  
         # context_layer: [b, np, sq, hn]
         return context_layer
